@@ -1,0 +1,191 @@
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ctfd-uploads
+  namespace: {{ namespace }}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: {{ storage_class }}
+  resources:
+    requests:
+      storage: {{ uploads_size }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mariadb-data
+  namespace: {{ namespace }}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: {{ storage_class }}
+  resources:
+    requests:
+      storage: {{ database_size }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: {{ namespace }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {app: redis}
+  template:
+    metadata:
+      labels: {app: redis}
+    spec:
+      containers:
+        - name: redis
+          image: {{ redis_image }}
+          command: [redis-server]
+          args: ["--save", "", "--appendonly", "no"]
+          ports: [{containerPort: 6379}]
+          readinessProbe:
+            exec:
+              command: [redis-cli, ping]
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {memory: 512Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ctfd-redis-cache
+  namespace: {{ namespace }}
+spec:
+  selector: {app: redis}
+  ports: [{port: 6379, targetPort: 6379}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mariadb
+  namespace: {{ namespace }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {app: mariadb}
+  template:
+    metadata:
+      labels: {app: mariadb}
+    spec:
+      securityContext:
+        fsGroup: {{ db_fs_group }}
+      containers:
+        - name: mariadb
+          image: {{ mariadb_image }}
+          env:
+            - {name: MARIADB_DATABASE, value: ctfd}
+            - {name: MARIADB_USER, value: ctfd}
+            - name: MARIADB_PASSWORD
+              valueFrom: {secretKeyRef: {name: ctfd-secrets, key: mariadb-password}}
+            - name: MARIADB_ROOT_PASSWORD
+              valueFrom: {secretKeyRef: {name: ctfd-secrets, key: mariadb-password}}
+          ports: [{containerPort: 3306}]
+          volumeMounts: [{name: data, mountPath: /var/lib/mysql}]
+          readinessProbe:
+            tcpSocket: {port: 3306}
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {memory: 1Gi}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: mariadb-data}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ctfd-mysql-db
+  namespace: {{ namespace }}
+spec:
+  selector: {app: mariadb}
+  ports: [{port: 3306, targetPort: 3306}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ctfd
+  namespace: {{ namespace }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {app: ctfd}
+  template:
+    metadata:
+      labels: {app: ctfd}
+    spec:
+      serviceAccountName: ctfd-runtime
+      securityContext:
+        fsGroup: {{ ctfd_fs_group }}
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: ctfd
+          image: {{ ctfd_image }}
+          ports: [{containerPort: 8000}]
+          env:
+            - {name: ACCESS_LOG, value: '-'}
+            - {name: ERROR_LOG, value: '-'}
+            - {name: REVERSE_PROXY, value: 'true'}
+            - {name: WORKERS, value: '1'}
+            - {name: LOG_FOLDER, value: /var/log/CTFd}
+            - {name: UPLOAD_FOLDER, value: /var/uploads}
+            - {name: REDIS_URL, value: 'redis://ctfd-redis-cache:6379'}
+            - name: DATABASE_URL
+              valueFrom: {secretKeyRef: {name: ctfd-secrets, key: database-url}}
+            - name: SECRET_KEY
+              valueFrom: {secretKeyRef: {name: ctfd-secrets, key: secret-key}}
+          volumeMounts:
+            - {name: uploads, mountPath: /var/uploads}
+            - {name: logs, mountPath: /var/log/CTFd}
+          startupProbe:
+            httpGet: {path: /, port: 8000}
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: {path: /, port: 8000}
+            periodSeconds: 10
+            timeoutSeconds: 3
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {memory: 1Gi}
+      volumes:
+        - name: uploads
+          persistentVolumeClaim: {claimName: ctfd-uploads}
+        - name: logs
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ctfd
+  namespace: {{ namespace }}
+spec:
+  selector: {app: ctfd}
+  ports: [{port: 8000, targetPort: 8000}]
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: island
+  namespace: {{ namespace }}
+spec:
+{% if route_host | length > 0 %}
+  host: {{ route_host }}
+{% endif %}
+  to: {kind: Service, name: ctfd}
+  port: {targetPort: 8000}
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

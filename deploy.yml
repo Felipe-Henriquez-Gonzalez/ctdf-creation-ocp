@@ -1,0 +1,108 @@
+---
+- name: Desplegar CTFd en OpenShift
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  collections:
+    - kubernetes.core
+  vars:
+    namespace: ctfd
+    ctfd_image: docker.io/ctfd/ctfd:3.7.7
+    redis_image: docker.io/library/redis:7.2-alpine
+    mariadb_image: docker.io/library/mariadb:10.11
+    storage_class: ocs-external-storagecluster-ceph-rbd
+    uploads_size: 2Gi
+    database_size: 5Gi
+    # Configurar según el rango SCC del namespace y el CSI del clúster.
+    ctfd_fs_group: 1000000000
+    db_fs_group: 999
+    # Definir por variables de entorno (no guardar secretos en Git).
+    db_password: "{{ lookup('env', 'CTFD_DB_PASSWORD') }}"
+    ctfd_secret: "{{ lookup('env', 'CTFD_SECRET_KEY') }}"
+    # Para entornos sin wildcard route, establecer CTFD_ROUTE_HOST.
+    route_host: "{{ lookup('env', 'CTFD_ROUTE_HOST') }}"
+  tasks:
+    - name: Verificar credenciales obligatorias
+      ansible.builtin.assert:
+        that:
+          - db_password | length >= 16
+          - ctfd_secret | length >= 32
+        fail_msg: 'Defina CTFD_DB_PASSWORD (>=16 caracteres) y CTFD_SECRET_KEY (>=32 caracteres).'
+      no_log: true
+
+    - name: Crear namespace
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ namespace }}"
+
+    - name: Crear ServiceAccount de CTFd
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: ctfd-runtime
+            namespace: "{{ namespace }}"
+
+    - name: Crear secreto con credenciales
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: ctfd-secrets
+            namespace: "{{ namespace }}"
+          type: Opaque
+          stringData:
+            database-url: "mysql+pymysql://ctfd:{{ db_password | urlencode }}@ctfd-mysql-db:3306/ctfd"
+            secret-key: "{{ ctfd_secret }}"
+            mariadb-password: "{{ db_password }}"
+      no_log: true
+
+    - name: Aplicar recursos de almacenamiento, red y aplicaciones
+      kubernetes.core.k8s:
+        state: present
+        definition: "{{ lookup('template', 'resources.yml.j2') | from_yaml_all | list }}"
+
+    - name: Esperar a MariaDB y Redis
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ namespace }}"
+        name: "{{ item }}"
+      register: dep
+      until: dep.resources | length > 0 and (dep.resources[0].status.availableReplicas | default(0)) | int >= 1
+      retries: 60
+      delay: 5
+      loop:
+        - mariadb
+        - redis
+
+    - name: Esperar a CTFd
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ namespace }}"
+        name: ctfd
+      register: ctfd_dep
+      until: ctfd_dep.resources | length > 0 and (ctfd_dep.resources[0].status.availableReplicas | default(0)) | int >= 1
+      retries: 60
+      delay: 5
+
+    - name: Obtener Route
+      kubernetes.core.k8s_info:
+        api_version: route.openshift.io/v1
+        kind: Route
+        namespace: "{{ namespace }}"
+        name: island
+      register: route
+
+    - name: Mostrar URL
+      ansible.builtin.debug:
+        msg: "CTFd disponible en https://{{ route.resources[0].spec.host }}"
